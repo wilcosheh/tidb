@@ -120,7 +120,7 @@ func getUpdateColumns(assignList []*expression.Assignment, fields []*field.Resul
 
 func updateRecord(ctx context.Context, h int64, data []interface{}, t table.Table,
 	updateColumns map[int]*expression.Assignment, m map[interface{}]interface{},
-	offset int, onDuplicateUpdate bool) error {
+	offset int) error {
 	if err := t.LockRow(ctx, h, true); err != nil {
 		return errors.Trace(err)
 	}
@@ -192,12 +192,7 @@ func updateRecord(ctx context.Context, h int64, data []interface{}, t table.Tabl
 		return errors.Trace(err)
 	}
 	// Record affected rows.
-	if !onDuplicateUpdate {
-		variable.GetSessionVars(ctx).AddAffectedRows(1)
-	} else {
-		variable.GetSessionVars(ctx).AddAffectedRows(2)
-
-	}
+	variable.GetSessionVars(ctx).AddAffectedRows(1)
 	return nil
 }
 
@@ -308,7 +303,7 @@ func (s *UpdateStmt) Exec(ctx context.Context) (_ rset.Recordset, err error) {
 				return nil, errors.Trace(err2)
 			}
 
-			err2 = updateRecord(ctx, handle, data, tbl, columns, m, lastOffset, false)
+			err2 = updateRecord(ctx, handle, data, tbl, columns, m, lastOffset)
 			if err2 != nil {
 				return nil, errors.Trace(err2)
 			}
