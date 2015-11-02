@@ -401,6 +401,10 @@ func (s *testSessionSuite) TestAffectedRows(c *C) {
 	c.Assert(int(se.AffectedRows()), Equals, 2)
 	mustExecSQL(c, se, `insert into t values (1, 1) on duplicate key update c2=2;`)
 	c.Assert(int(se.AffectedRows()), Equals, 0)
+	mustExecSQL(c, se, `insert into t select * from t limit 1 on duplicate key update c1=2;`)
+	c.Assert(int(se.AffectedRows()), Equals, 2)
+	mustExecSQL(c, se, `insert into t select * from t limit 1 on duplicate key update c1=2;`)
+	c.Assert(int(se.AffectedRows()), Equals, 0)
 
 	se.SetClientCapability(mysql.ClientFoundRows)
 	mustExecSQL(c, se, s.dropTableSQL)

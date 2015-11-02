@@ -125,4 +125,10 @@ func (s *testStmtSuite) TestReplace(c *C) {
 	rows, err = ret.RowsAffected()
 	c.Assert(err, IsNil)
 	c.Assert(rows, Equals, int64(1))
+
+	replacePrimaryKeySQL = `replace into replace_test_5 select * from replace_test_5 limit 1`
+	ret = mustExec(c, s.testDB, replacePrimaryKeySQL)
+	rows, err = ret.RowsAffected()
+	c.Assert(err, IsNil)
+	c.Assert(rows, Equals, int64(1))
 }

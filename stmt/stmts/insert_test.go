@@ -21,8 +21,8 @@ import (
 
 func (s *testStmtSuite) TestInsert(c *C) {
 	testSQL := `drop table if exists insert_test;
-    create table insert_test (id int PRIMARY KEY AUTO_INCREMENT, c1 int, c2 int, c3 int default 1);
-    insert insert_test (c1) values (1),(2),(NULL);`
+    	create table insert_test (id int PRIMARY KEY AUTO_INCREMENT, c1 int, c2 int, c3 int default 1);
+   	insert insert_test (c1) values (1),(2),(NULL);`
 	mustExec(c, s.testDB, testSQL)
 
 	errInsertSelectSQL := `insert insert_test (c1) values ();`
@@ -74,7 +74,8 @@ func (s *testStmtSuite) TestInsert(c *C) {
 	c.Assert(err, NotNil)
 	tx.Rollback()
 
-	insertSelectSQL := `create table insert_test_1 (id int, c1 int); insert insert_test_1 select id, c1 from insert_test;`
+	insertSelectSQL := `create table insert_test_1 (id int, c1 int); 
+	insert insert_test_1 select id, c1 from insert_test;`
 	mustExec(c, s.testDB, insertSelectSQL)
 
 	insertSelectSQL = `create table insert_test_2 (id int, c1 int); 
@@ -88,10 +89,22 @@ func (s *testStmtSuite) TestInsert(c *C) {
 	tx.Rollback()
 
 	insertSQL := `insert into insert_test (id, c2) values (1, 1) on duplicate key update c2=10;`
-	mustExec(c, s.testDB, insertSQL)
+	ret := mustExec(c, s.testDB, insertSQL)
+	rows, err := ret.RowsAffected()
+	c.Assert(err, IsNil)
+	c.Assert(rows, Equals, int64(2))
 
-	insertSQL = `insert into insert_test (id, c2) values (1, 1) on duplicate key update insert_test.c2=10;`
-	mustExec(c, s.testDB, insertSQL)
+	insertSQL = `insert into insert_test select * from insert_test limit 1 on duplicate key update c2=10;`
+	ret = mustExec(c, s.testDB, insertSQL)
+	rows, err = ret.RowsAffected()
+	c.Assert(err, IsNil)
+	c.Assert(rows, Equals, int64(1))
+
+	insertSQL = `insert into insert_test select * from insert_test limit 1 on duplicate key update c2=10;`
+	ret = mustExec(c, s.testDB, insertSQL)
+	rows, err = ret.RowsAffected()
+	c.Assert(err, IsNil)
+	c.Assert(rows, Equals, int64(0))
 
 	_, err = s.testDB.Exec(`insert into insert_test (id, c2) values(1, 1) on duplicate key update t.c2 = 10`)
 	c.Assert(err, NotNil)
