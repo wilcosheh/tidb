@@ -56,7 +56,7 @@ func (s *ReplaceIntoStmt) SetText(text string) {
 }
 
 // Exec implements the stmt.Statement Exec interface.
-func (s *ReplaceIntoStmt) Exec(ctx context.Context) (_ rset.Recordset, err error) {
+func (s *ReplaceIntoStmt) Exec(ctx context.Context) (rset.Recordset, error) {
 	t, err := getTable(ctx, s.TableIdent)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -69,7 +69,12 @@ func (s *ReplaceIntoStmt) Exec(ctx context.Context) (_ rset.Recordset, err error
 	// Process `replace ... (select ...)`
 	// TODO: handles the duplicate-key in a primary key or a unique index.
 	if s.Sel != nil {
-		return s.execSelect(t, cols, ctx)
+		return s.execSelect(t, ctx, cols,
+			func(ctx context.Context, t table.Table, h int64, row []interface{}) error {
+				_, err := replaceRow(ctx, t, h, row, nil)
+				variable.GetSessionVars(ctx).AddAffectedRows(1)
+				return err
+			})
 	}
 	// Process `replace ... set x=y ...`
 	if err = s.fillValueList(); err != nil {
@@ -85,7 +90,7 @@ func (s *ReplaceIntoStmt) Exec(ctx context.Context) (_ rset.Recordset, err error
 		if err = s.checkValueCount(replaceValueCount, len(list), i, cols); err != nil {
 			return nil, errors.Trace(err)
 		}
-		row, err := s.getRow(ctx, t, cols, list, m)
+		marked, row, err := s.getRow(ctx, t, cols, list, m, true)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -93,14 +98,14 @@ func (s *ReplaceIntoStmt) Exec(ctx context.Context) (_ rset.Recordset, err error
 		if err == nil {
 			continue
 		}
-		if err != nil && !errors2.ErrorEqual(err, kv.ErrKeyExists) {
+		if !errors2.ErrorEqual(err, kv.ErrKeyExists) {
 			return nil, errors.Trace(err)
 		}
 
 		// While the insertion fails because a duplicate-key error occurs for a primary key or unique index,
 		// a storage engine may perform the REPLACE as an update rather than a delete plus insert.
 		// See: http://dev.mysql.com/doc/refman/5.7/en/replace.html.
-		if err = replaceRow(ctx, t, h, row); err != nil {
+		if _, err = replaceRow(ctx, t, h, row, marked); err != nil {
 			return nil, errors.Trace(err)
 		}
 		variable.GetSessionVars(ctx).AddAffectedRows(1)
@@ -109,10 +114,11 @@ func (s *ReplaceIntoStmt) Exec(ctx context.Context) (_ rset.Recordset, err error
 	return nil, nil
 }
 
-func replaceRow(ctx context.Context, t table.Table, handle int64, replaceRow []interface{}) error {
+func replaceRow(ctx context.Context, t table.Table, handle int64, replaceRow []interface{},
+	marked map[int]struct{}) (bool, error) {
 	row, err := t.Row(ctx, handle)
 	if err != nil {
-		return errors.Trace(err)
+		return false, errors.Trace(err)
 	}
 
 	isReplace := false
@@ -120,7 +126,14 @@ func replaceRow(ctx context.Context, t table.Table, handle int64, replaceRow []i
 	for i, val := range row {
 		v, err1 := types.Compare(val, replaceRow[i])
 		if err1 != nil {
-			return errors.Trace(err1)
+			return false, errors.Trace(err1)
+		}
+
+		if marked != nil {
+			if _, ok := marked[i]; !ok {
+				replaceRow[i] = v
+				continue
+			}
 		}
 		if v != 0 {
 			touched[i] = true
@@ -130,9 +143,9 @@ func replaceRow(ctx context.Context, t table.Table, handle int64, replaceRow []i
 	if isReplace {
 		variable.GetSessionVars(ctx).AddAffectedRows(1)
 		if err = t.UpdateRecord(ctx, handle, row, replaceRow, touched); err != nil {
-			return errors.Trace(err)
+			return false, errors.Trace(err)
 		}
 	}
 
-	return nil
+	return isReplace, nil
 }

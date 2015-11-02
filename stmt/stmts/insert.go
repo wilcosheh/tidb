@@ -86,7 +86,8 @@ func (s *InsertIntoStmt) SetText(text string) {
 }
 
 // execExecSelect implements `insert table select ... from ...`.
-func (s *InsertValues) execSelect(t table.Table, cols []*column.Col, ctx context.Context) (rset.Recordset, error) {
+func (s *InsertValues) execSelect(t table.Table, ctx context.Context, cols []*column.Col,
+	updateFunc func(ctx context.Context, t table.Table, handle int64, updateRow []interface{}) error) (rset.Recordset, error) {
 	r, err := s.Sel.Plan(ctx)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -117,14 +118,13 @@ func (s *InsertValues) execSelect(t table.Table, cols []*column.Col, ctx context
 		if err = s.initDefaultValues(ctx, t, data0, marked); err != nil {
 			return nil, errors.Trace(err)
 		}
-
 		if err = column.CastValues(ctx, data0, cols); err != nil {
 			return nil, errors.Trace(err)
 		}
-
 		if err = column.CheckNotNull(t.Cols(), data0); err != nil {
 			return nil, errors.Trace(err)
 		}
+
 		var v interface{}
 		v, err = types.Clone(data0)
 		if err != nil {
@@ -137,7 +137,15 @@ func (s *InsertValues) execSelect(t table.Table, cols []*column.Col, ctx context
 
 	for i, r := range bufRecords {
 		variable.GetSessionVars(ctx).SetLastInsertID(lastInsertIds[i])
-		if _, err = t.AddRecord(ctx, r); err != nil {
+		h, err := t.AddRecord(ctx, r)
+		if err == nil {
+			continue
+		}
+
+		if updateFunc == nil || !errors2.ErrorEqual(err, kv.ErrKeyExists) {
+			return nil, errors.Trace(err)
+		}
+		if err = updateFunc(ctx, t, h, r); err != nil {
 			return nil, errors.Trace(err)
 		}
 	}
@@ -231,11 +239,18 @@ func (s *InsertIntoStmt) Exec(ctx context.Context) (_ rset.Recordset, err error)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	toUpdateCols, toUpdateExprs, err := getOnDuplicateUpdateColumns(s.OnDuplicate, t)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
 
 	// Process `insert ... (select ..) `
 	// TODO: handles the duplicate-key in a primary key or a unique index.
 	if s.Sel != nil {
-		return s.execSelect(t, cols, ctx)
+		return s.execSelect(t, ctx, cols,
+			func(ctx context.Context, t table.Table, h int64, row []interface{}) error {
+				return s.execOnDuplicateUpdate(ctx, t, h, row, toUpdateCols, toUpdateExprs)
+			})
 	}
 
 	// Process `insert ... set x=y...`
@@ -248,17 +263,13 @@ func (s *InsertIntoStmt) Exec(ctx context.Context) (_ rset.Recordset, err error)
 		return nil, errors.Trace(err)
 	}
 	insertValueCount := len(s.Lists[0])
-	toUpdateColumns, err := getOnDuplicateUpdateColumns(s.OnDuplicate, t)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
 
 	for i, list := range s.Lists {
 		if err = s.checkValueCount(insertValueCount, len(list), i, cols); err != nil {
 			return nil, errors.Trace(err)
 		}
 
-		row, err := s.getRow(ctx, t, cols, list, m)
+		_, row, err := s.getRow(ctx, t, cols, list, m, true)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -276,7 +287,7 @@ func (s *InsertIntoStmt) Exec(ctx context.Context) (_ rset.Recordset, err error)
 		if len(s.OnDuplicate) == 0 || !errors2.ErrorEqual(err, kv.ErrKeyExists) {
 			return nil, errors.Trace(err)
 		}
-		if err = execOnDuplicateUpdate(ctx, t, row, h, toUpdateColumns); err != nil {
+		if err = s.execOnDuplicateUpdate(ctx, t, h, row, toUpdateCols, toUpdateExprs); err != nil {
 			return nil, errors.Trace(err)
 		}
 	}
@@ -303,7 +314,8 @@ func (s *InsertValues) checkValueCount(insertValueCount, valueCount, num int, co
 	return nil
 }
 
-func (s *InsertValues) getRow(ctx context.Context, t table.Table, cols []*column.Col, list []expression.Expression, m map[interface{}]interface{}) ([]interface{}, error) {
+func (s *InsertValues) getRow(ctx context.Context, t table.Table, cols []*column.Col, list []expression.Expression,
+	m map[interface{}]interface{}, isCheckNotNull bool) (map[int]struct{}, []interface{}, error) {
 	r := make([]interface{}, len(t.Cols()))
 	marked := make(map[int]struct{}, len(list))
 	for i, expr := range list {
@@ -312,7 +324,7 @@ func (s *InsertValues) getRow(ctx context.Context, t table.Table, cols []*column
 
 		val, err := expr.Eval(ctx, m)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, nil, errors.Trace(err)
 		}
 		r[cols[i].Offset] = val
 		marked[cols[i].Offset] = struct{}{}
@@ -323,54 +335,66 @@ func (s *InsertValues) getRow(ctx context.Context, t table.Table, cols []*column
 
 	err := s.initDefaultValues(ctx, t, r, marked)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, nil, errors.Trace(err)
 	}
 	if err = column.CastValues(ctx, r, cols); err != nil {
-		return nil, errors.Trace(err)
+		return nil, nil, errors.Trace(err)
+	}
+
+	if !isCheckNotNull {
+		return marked, r, nil
 	}
 	if err = column.CheckNotNull(t.Cols(), r); err != nil {
-		return nil, errors.Trace(err)
+		return nil, nil, errors.Trace(err)
 	}
 
-	return r, nil
+	return marked, r, nil
 }
 
-func execOnDuplicateUpdate(ctx context.Context, t table.Table, row []interface{}, h int64, cols map[int]*expression.Assignment) error {
+func (s *InsertIntoStmt) execOnDuplicateUpdate(ctx context.Context, t table.Table, h int64, row []interface{},
+	toUpdateCols []*column.Col, toUpdateExprs []expression.Expression) error {
 	// On duplicate key update the duplicate row.
 	// Evaluate the updated value.
-	// TODO: report rows affected and last insert id.
-	data, err := t.Row(ctx, h)
+	// TODO: report last insert id.
+	toUpdateArgs := map[interface{}]interface{}{}
+	toUpdateArgs[expression.ExprEvalValuesFunc] = func(name string) (interface{}, error) {
+		c, err := findColumnByName(t, name)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		return row[c.Offset], nil
+	}
+	marked, toUpdateRow, err := s.getRow(ctx, t, toUpdateCols, toUpdateExprs, toUpdateArgs, false)
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	toUpdateArgs := map[interface{}]interface{}{}
-	toUpdateArgs[expression.ExprEvalValuesFunc] = func(name string) (interface{}, error) {
-		c, err1 := findColumnByName(t, name)
-		if err1 != nil {
-			return nil, errors.Trace(err1)
-		}
-		return row[c.Offset], nil
-	}
-
-	if err = updateRecord(ctx, h, data, t, cols, toUpdateArgs, 0, true); err != nil {
+	hasReplace, err := replaceRow(ctx, t, h, toUpdateRow, marked)
+	if err != nil {
 		return errors.Trace(err)
+	}
+	if hasReplace {
+		variable.GetSessionVars(ctx).AddAffectedRows(1)
 	}
 
 	return nil
 }
 
-func getOnDuplicateUpdateColumns(assignList []*expression.Assignment, t table.Table) (map[int]*expression.Assignment, error) {
-	m := make(map[int]*expression.Assignment, len(assignList))
+func getOnDuplicateUpdateColumns(assignList []*expression.Assignment, t table.Table) ([]*column.Col,
+	[]expression.Expression, error) {
+	cols := make([]*column.Col, (len(assignList)))
+	m := make([]expression.Expression, len(assignList))
 
-	for _, v := range assignList {
+	for i, v := range assignList {
 		c, err := findColumnByName(t, field.JoinQualifiedName("", v.TableName, v.ColName))
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, nil, errors.Trace(err)
 		}
-		m[c.Offset] = v
+		cols[i] = c
+		m[i] = v.Expr
 	}
-	return m, nil
+
+	return cols, m, nil
 }
 
 func (s *InsertValues) initDefaultValues(ctx context.Context, t table.Table, row []interface{}, marked map[int]struct{}) error {
